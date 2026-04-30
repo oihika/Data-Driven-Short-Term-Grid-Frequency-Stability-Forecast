@@ -1,0 +1,210 @@
+# grid_frequency_forecast_live_graphs.py
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+os.makedirs("data", exist_ok=True)
+os.makedirs("outputs/results", exist_ok=True)
+
+np.random.seed(42)
+
+# -----------------------------
+# Generate sample data
+# -----------------------------
+time = pd.date_range(start="2024-01-01", periods=3000, freq="5min")
+
+temperature = 12 + 8 * np.sin(np.linspace(0, 25, len(time))) + np.random.normal(0, 1, len(time))
+wind_speed = 6 + 2 * np.sin(np.linspace(0, 35, len(time))) + np.random.normal(0, 0.8, len(time))
+solar_irradiance = np.maximum(
+    0,
+    700 * np.sin(np.linspace(0, 60, len(time))) + np.random.normal(0, 45, len(time))
+)
+
+solar_proxy = solar_irradiance * 0.18
+wind_proxy = wind_speed ** 3
+load_proxy = 1200 + 100 * np.sin(np.linspace(0, 20, len(time))) + np.random.normal(0, 25, len(time))
+
+frequency = (
+    50
+    + 0.00008 * solar_proxy
+    + 0.00003 * wind_proxy
+    - 0.00006 * load_proxy
+    + np.random.normal(0, 0.025, len(time))
+)
+
+df = pd.DataFrame({
+    "timestamp": time,
+    "frequency_hz": frequency,
+    "temperature_c": temperature,
+    "wind_speed_ms": wind_speed,
+    "solar_irradiance_wm2": solar_irradiance,
+    "solar_generation_proxy": solar_proxy,
+    "wind_generation_proxy": wind_proxy,
+    "load_proxy": load_proxy
+})
+
+df.to_csv("data/grid_frequency_sample.csv", index=False)
+
+# -----------------------------
+# Feature engineering
+# -----------------------------
+horizon_steps = 3  # 15-minute forecast
+
+df["hour"] = df["timestamp"].dt.hour
+df["dayofweek"] = df["timestamp"].dt.dayofweek
+
+df["frequency_lag_1"] = df["frequency_hz"].shift(1)
+df["frequency_lag_2"] = df["frequency_hz"].shift(2)
+df["frequency_lag_3"] = df["frequency_hz"].shift(3)
+
+df["frequency_rolling_mean"] = df["frequency_hz"].rolling(6).mean()
+df["frequency_rolling_std"] = df["frequency_hz"].rolling(6).std()
+
+df["target_frequency"] = df["frequency_hz"].shift(-horizon_steps)
+df["target_deviation"] = df["target_frequency"] - 50.0
+
+df = df.dropna()
+
+# -----------------------------
+# Model training
+# -----------------------------
+features = [
+    "temperature_c",
+    "wind_speed_ms",
+    "solar_irradiance_wm2",
+    "solar_generation_proxy",
+    "wind_generation_proxy",
+    "load_proxy",
+    "hour",
+    "dayofweek",
+    "frequency_lag_1",
+    "frequency_lag_2",
+    "frequency_lag_3",
+    "frequency_rolling_mean",
+    "frequency_rolling_std"
+]
+
+X = df[features]
+y = df["target_deviation"]
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, shuffle=False
+)
+
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+model = RandomForestRegressor(
+    n_estimators=300,
+    max_depth=12,
+    random_state=42
+)
+
+model.fit(X_train_scaled, y_train)
+prediction = model.predict(X_test_scaled)
+
+mae = mean_absolute_error(y_test, prediction)
+rmse = np.sqrt(mean_squared_error(y_test, prediction))
+
+results = pd.DataFrame({
+    "Model": ["Random Forest"],
+    "MAE": [mae],
+    "RMSE": [rmse]
+})
+
+results.to_csv("outputs/results/model_performance.csv", index=False)
+
+print("\nModel Performance")
+print(results)
+
+# -----------------------------
+# LIVE GRAPH OUTPUTS
+# -----------------------------
+
+test_time = df["timestamp"].iloc[-len(y_test):]
+residuals = y_test.values - prediction
+
+# Graph 1
+plt.figure(figsize=(12, 5))
+plt.plot(df["timestamp"], df["frequency_hz"], color="blue", linewidth=1.2)
+plt.axhline(50, color="red", linestyle="--", linewidth=1.5)
+plt.xlabel("Time")
+plt.ylabel("Frequency Hz")
+plt.title("Grid Frequency Time Series")
+plt.grid(True)
+
+# Graph 2
+plt.figure(figsize=(12, 5))
+plt.plot(test_time, y_test.values, color="green", label="Actual Deviation", linewidth=1.5)
+plt.plot(test_time, prediction, color="orange", label="Predicted Deviation", linewidth=1.5)
+plt.xlabel("Time")
+plt.ylabel("Frequency Deviation from 50 Hz")
+plt.title("Actual vs Predicted Frequency Deviation")
+plt.legend()
+plt.grid(True)
+
+# Graph 3
+plt.figure(figsize=(10, 5))
+plt.hist(residuals, bins=40, color="purple", edgecolor="black")
+plt.xlabel("Prediction Error")
+plt.ylabel("Frequency")
+plt.title("Residual Error Distribution")
+plt.grid(True)
+
+# Graph 4
+importance = model.feature_importances_
+indices = np.argsort(importance)[::-1]
+
+plt.figure(figsize=(11, 6))
+plt.bar(range(len(features)), importance[indices], color="teal")
+plt.xticks(range(len(features)), np.array(features)[indices], rotation=75)
+plt.ylabel("Importance Score")
+plt.title("Feature Importance for Grid Frequency Forecasting")
+plt.grid(True)
+
+# Graph 5
+plt.figure(figsize=(12, 5))
+plt.plot(df["timestamp"], df["solar_generation_proxy"], color="gold", label="Solar Generation Proxy")
+plt.plot(df["timestamp"], df["wind_generation_proxy"], color="deepskyblue", label="Wind Generation Proxy")
+plt.xlabel("Time")
+plt.ylabel("Generation Proxy")
+plt.title("Solar and Wind Renewable Generation Proxies")
+plt.legend()
+plt.grid(True)
+
+# Graph 6
+plt.figure(figsize=(12, 5))
+plt.plot(df["timestamp"], df["load_proxy"], color="black", label="Load Proxy")
+plt.plot(df["timestamp"], df["solar_generation_proxy"], color="orange", label="Solar Proxy")
+plt.plot(df["timestamp"], df["wind_generation_proxy"], color="green", label="Wind Proxy")
+plt.xlabel("Time")
+plt.ylabel("Power / Proxy Value")
+plt.title("Load Demand vs Renewable Generation Proxies")
+plt.legend()
+plt.grid(True)
+
+# Graph 7
+plt.figure(figsize=(6, 6))
+plt.scatter(y_test, prediction, color="crimson", alpha=0.6)
+plt.xlabel("Actual Frequency Deviation")
+plt.ylabel("Predicted Frequency Deviation")
+plt.title("Actual vs Predicted Scatter Plot")
+plt.grid(True)
+
+# Graph 8
+plt.figure(figsize=(7, 5))
+plt.bar(["MAE", "RMSE"], [mae, rmse], color=["skyblue", "salmon"])
+plt.ylabel("Error Value")
+plt.title("Model Performance Metrics")
+plt.grid(True)
+
+# Show all graphs live
+plt.show()
