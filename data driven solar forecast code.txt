@@ -1,0 +1,303 @@
+# grid_frequency_forecast.py
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+try:
+    from xgboost import XGBRegressor
+    XGBOOST_AVAILABLE = True
+except ImportError:
+    XGBOOST_AVAILABLE = False
+
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+
+
+# -------------------------------
+# Create folders
+# -------------------------------
+os.makedirs("data", exist_ok=True)
+os.makedirs("outputs/graphs", exist_ok=True)
+os.makedirs("outputs/results", exist_ok=True)
+
+
+# -------------------------------
+# Generate sample grid-frequency dataset
+# Replace this later with ENTSO-E frequency + NASA POWER data
+# -------------------------------
+def generate_sample_data():
+    np.random.seed(42)
+
+    time_index = pd.date_range(
+        start="2024-01-01",
+        periods=3000,
+        freq="5min"
+    )
+
+    temperature = 10 + 8 * np.sin(np.linspace(0, 20, len(time_index))) + np.random.normal(0, 1, len(time_index))
+    wind_speed = 6 + 2 * np.sin(np.linspace(0, 35, len(time_index))) + np.random.normal(0, 0.7, len(time_index))
+    solar_irradiance = np.maximum(
+        0,
+        700 * np.sin(np.linspace(0, 60, len(time_index))) + np.random.normal(0, 40, len(time_index))
+    )
+
+    wind_generation_proxy = wind_speed ** 3
+    solar_generation_proxy = solar_irradiance * 0.18
+
+    load_proxy = 1200 + 80 * np.sin(np.linspace(0, 25, len(time_index))) + np.random.normal(0, 30, len(time_index))
+
+    frequency = (
+        50
+        + 0.00008 * solar_generation_proxy
+        + 0.00003 * wind_generation_proxy
+        - 0.00006 * load_proxy
+        + np.random.normal(0, 0.025, len(time_index))
+    )
+
+    df = pd.DataFrame({
+        "timestamp": time_index,
+        "frequency_hz": frequency,
+        "temperature_c": temperature,
+        "wind_speed_ms": wind_speed,
+        "solar_irradiance_wm2": solar_irradiance,
+        "solar_generation_proxy": solar_generation_proxy,
+        "wind_generation_proxy": wind_generation_proxy,
+        "load_proxy": load_proxy
+    })
+
+    df.to_csv("data/grid_frequency_sample.csv", index=False)
+    return df
+
+
+# -------------------------------
+# Feature engineering
+# -------------------------------
+def create_features(df, horizon_steps=3):
+    df = df.copy()
+
+    df["hour"] = df["timestamp"].dt.hour
+    df["dayofweek"] = df["timestamp"].dt.dayofweek
+
+    df["frequency_lag_1"] = df["frequency_hz"].shift(1)
+    df["frequency_lag_2"] = df["frequency_hz"].shift(2)
+    df["frequency_lag_3"] = df["frequency_hz"].shift(3)
+
+    df["frequency_rolling_mean"] = df["frequency_hz"].rolling(6).mean()
+    df["frequency_rolling_std"] = df["frequency_hz"].rolling(6).std()
+
+    df["target_frequency"] = df["frequency_hz"].shift(-horizon_steps)
+    df["target_deviation"] = df["target_frequency"] - 50.0
+
+    df = df.dropna()
+
+    return df
+
+
+# -------------------------------
+# Prepare LSTM data
+# -------------------------------
+def create_lstm_sequences(X, y, sequence_length=12):
+    X_seq, y_seq = [], []
+
+    for i in range(sequence_length, len(X)):
+        X_seq.append(X[i-sequence_length:i])
+        y_seq.append(y[i])
+
+    return np.array(X_seq), np.array(y_seq)
+
+
+# -------------------------------
+# Plot and save graphs
+# -------------------------------
+def save_graphs(df, y_test, rf_pred, feature_names, rf_model):
+    plt.figure(figsize=(12, 5))
+    plt.plot(df["timestamp"].iloc[-len(y_test):], y_test.values, label="Actual Frequency Deviation")
+    plt.plot(df["timestamp"].iloc[-len(y_test):], rf_pred, label="Predicted Frequency Deviation")
+    plt.xlabel("Time")
+    plt.ylabel("Frequency Deviation from 50 Hz")
+    plt.title("Actual vs Predicted Grid Frequency Deviation")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("outputs/graphs/actual_vs_predicted.png", dpi=300)
+    plt.close()
+
+    residuals = y_test.values - rf_pred
+
+    plt.figure(figsize=(10, 5))
+    plt.hist(residuals, bins=40)
+    plt.xlabel("Prediction Error")
+    plt.ylabel("Count")
+    plt.title("Residual Error Distribution")
+    plt.tight_layout()
+    plt.savefig("outputs/graphs/residual_distribution.png", dpi=300)
+    plt.close()
+
+    importances = rf_model.feature_importances_
+    indices = np.argsort(importances)[::-1]
+
+    plt.figure(figsize=(10, 6))
+    plt.bar(range(len(feature_names)), importances[indices])
+    plt.xticks(range(len(feature_names)), np.array(feature_names)[indices], rotation=75)
+    plt.ylabel("Importance Score")
+    plt.title("Random Forest Feature Importance")
+    plt.tight_layout()
+    plt.savefig("outputs/graphs/feature_importance.png", dpi=300)
+    plt.close()
+
+    plt.figure(figsize=(12, 5))
+    plt.plot(df["timestamp"], df["frequency_hz"])
+    plt.axhline(50.0, linestyle="--")
+    plt.xlabel("Time")
+    plt.ylabel("Frequency Hz")
+    plt.title("Grid Frequency Time Series")
+    plt.tight_layout()
+    plt.savefig("outputs/graphs/grid_frequency_timeseries.png", dpi=300)
+    plt.close()
+
+
+# -------------------------------
+# Main model training
+# -------------------------------
+def main():
+    df = generate_sample_data()
+
+    # 5-minute horizon = 1 step
+    # 15-minute horizon = 3 steps
+    df = create_features(df, horizon_steps=3)
+
+    feature_cols = [
+        "temperature_c",
+        "wind_speed_ms",
+        "solar_irradiance_wm2",
+        "solar_generation_proxy",
+        "wind_generation_proxy",
+        "load_proxy",
+        "hour",
+        "dayofweek",
+        "frequency_lag_1",
+        "frequency_lag_2",
+        "frequency_lag_3",
+        "frequency_rolling_mean",
+        "frequency_rolling_std"
+    ]
+
+    X = df[feature_cols]
+    y = df["target_deviation"]
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, shuffle=False
+    )
+
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    results = []
+
+    # Random Forest
+    rf = RandomForestRegressor(
+        n_estimators=300,
+        max_depth=12,
+        random_state=42
+    )
+    rf.fit(X_train_scaled, y_train)
+    rf_pred = rf.predict(X_test_scaled)
+
+    rf_mae = mean_absolute_error(y_test, rf_pred)
+    rf_rmse = np.sqrt(mean_squared_error(y_test, rf_pred))
+
+    results.append(["Random Forest", rf_mae, rf_rmse])
+
+    # XGBoost
+    if XGBOOST_AVAILABLE:
+        xgb = XGBRegressor(
+            n_estimators=300,
+            learning_rate=0.05,
+            max_depth=5,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            random_state=42
+        )
+        xgb.fit(X_train_scaled, y_train)
+        xgb_pred = xgb.predict(X_test_scaled)
+
+        xgb_mae = mean_absolute_error(y_test, xgb_pred)
+        xgb_rmse = np.sqrt(mean_squared_error(y_test, xgb_pred))
+
+        results.append(["XGBoost", xgb_mae, xgb_rmse])
+
+    # LSTM
+    sequence_length = 12
+
+    X_lstm, y_lstm = create_lstm_sequences(
+        np.array(X_train_scaled.tolist() + X_test_scaled.tolist()),
+        np.array(y.tolist()),
+        sequence_length
+    )
+
+    split_index = int(len(X_lstm) * 0.8)
+
+    X_lstm_train = X_lstm[:split_index]
+    X_lstm_test = X_lstm[split_index:]
+    y_lstm_train = y_lstm[:split_index]
+    y_lstm_test = y_lstm[split_index:]
+
+    lstm_model = Sequential([
+        LSTM(64, return_sequences=True, input_shape=(X_lstm_train.shape[1], X_lstm_train.shape[2])),
+        Dropout(0.2),
+        LSTM(32),
+        Dropout(0.2),
+        Dense(1)
+    ])
+
+    lstm_model.compile(optimizer="adam", loss="mse")
+
+    early_stop = EarlyStopping(
+        monitor="val_loss",
+        patience=5,
+        restore_best_weights=True
+    )
+
+    lstm_model.fit(
+        X_lstm_train,
+        y_lstm_train,
+        validation_split=0.2,
+        epochs=30,
+        batch_size=32,
+        callbacks=[early_stop],
+        verbose=1
+    )
+
+    lstm_pred = lstm_model.predict(X_lstm_test).flatten()
+
+    lstm_mae = mean_absolute_error(y_lstm_test, lstm_pred)
+    lstm_rmse = np.sqrt(mean_squared_error(y_lstm_test, lstm_pred))
+
+    results.append(["LSTM", lstm_mae, lstm_rmse])
+
+    results_df = pd.DataFrame(
+        results,
+        columns=["Model", "MAE", "RMSE"]
+    )
+
+    results_df.to_csv("outputs/results/model_performance.csv", index=False)
+
+    save_graphs(df, y_test, rf_pred, feature_cols, rf)
+
+    print("\nModel Performance:")
+    print(results_df)
+
+    print("\nGraphs saved in: outputs/graphs/")
+    print("Results saved in: outputs/results/model_performance.csv")
+
+
+if __name__ == "__main__":
+    main()
