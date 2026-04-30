@@ -1,5 +1,4 @@
-
- Data-Driven Short-Term Grid Frequency Stability Forecast
+⚡ Data-Driven Short-Term Grid Frequency Stability Forecast
 🌍 AI-Powered Renewable-Aware Smart Grid Forecasting for Short-Term Frequency Stability
 
 
